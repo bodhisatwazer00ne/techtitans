@@ -1,14 +1,9 @@
 import express from "express";
 import path from "path";
-import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Lazy/safe initialization of GoogleGenAI
 let genAIClient: GoogleGenAI | null = null;
@@ -253,6 +248,7 @@ Format strictly as JSON with keys:
 
   // Vite middleware for development vs static build for production
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",

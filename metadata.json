@@ -1,0 +1,8 @@
+{
+  "name": "Life RPG",
+  "description": "Retro pixel RPG where your real-world habits power character stats, arena stat clashes, power scaling, and global leaderboard rankings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

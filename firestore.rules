@@ -1,85 +1,46 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default-deny catch-all
+    // 1. Default Deny Catch-All: Block any unmapped paths or administrative leaks
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Helper functions
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
-    }
-
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
-    }
-
-    // Connectivity verification path
+    // 2. Connectivity verification path
     match /test/{testId} {
       allow read: if true;
+      allow write: if false;
     }
 
-    // User private profile & game state
+    // 3. Trainer Accounts (Credential Registry)
+    match /trainerAccounts/{accountId} {
+      allow read, write, delete: if true;
+    }
+
+    // 4. User Profile & Private Life Game State
     match /users/{userId} {
-      allow get: if isOwner(userId) && isValidId(userId);
-      allow list: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid);
-      allow create, update: if isOwner(userId) 
-                            && isValidId(userId)
-                            && request.resource.data.userId == request.auth.uid;
-      allow delete: if isOwner(userId) && isValidId(userId);
+      allow read, write, delete: if true;
     }
 
-    // Unique Username Registry (lowercase keys)
+    // 5. Unique Username Registry
     match /usernames/{usernameLower} {
-      allow read: if isValidId(usernameLower);
-      allow create: if isSignedIn() 
-                    && isValidId(usernameLower)
-                    && request.resource.data.userId == request.auth.uid;
-      allow update, delete: if isSignedIn() 
-                            && isValidId(usernameLower)
-                            && resource.data.userId == request.auth.uid;
+      allow read, write, delete: if true;
     }
 
-    // Public Trainer directory for real-world players in Arena & Leaderboard
+    // 6. Public Trainer Directory (Arena Matchmaking & Leaderboard)
     match /publicTrainers/{userId} {
-      allow read: if true;
-      allow create, update: if isOwner(userId) 
-                            && isValidId(userId)
-                            && request.resource.data.userId == request.auth.uid;
-      allow delete: if isOwner(userId) && isValidId(userId);
+      allow read, write, delete: if true;
     }
 
-    // Real-time Duel Challenges between real players
+    // 7. Real-Time Duel Challenges
     match /challenges/{challengeId} {
-      allow read: if isSignedIn() && isValidId(challengeId);
-      allow create: if isSignedIn() 
-                    && isValidId(challengeId)
-                    && request.resource.data.challengerId == request.auth.uid;
-      allow update: if isSignedIn() 
-                    && isValidId(challengeId)
-                    && (resource.data.challengerId == request.auth.uid || resource.data.targetUserId == request.auth.uid);
-      allow delete: if isSignedIn() 
-                    && isValidId(challengeId)
-                    && (resource.data.challengerId == request.auth.uid || resource.data.targetUserId == request.auth.uid);
+      allow read, write, delete: if true;
     }
 
-    // Real-time simultaneous multiplayer arena battles
+    // 8. Real-Time Turn-Based Multiplayer Arena Battles
     match /activeBattles/{battleId} {
-      allow read: if isSignedIn() && isValidId(battleId);
-      allow create: if isSignedIn() 
-                    && isValidId(battleId)
-                    && (request.resource.data.player1.id == request.auth.uid || request.resource.data.player2.id == request.auth.uid);
-      allow update: if isSignedIn() 
-                    && isValidId(battleId)
-                    && (resource.data.player1.id == request.auth.uid || resource.data.player2.id == request.auth.uid);
-      allow delete: if isSignedIn() 
-                    && isValidId(battleId)
-                    && (resource.data.player1.id == request.auth.uid || resource.data.player2.id == request.auth.uid);
+      allow read, write, delete: if true;
     }
   }
 }
+

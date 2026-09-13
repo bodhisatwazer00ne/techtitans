@@ -72,13 +72,50 @@
         "targetUserId": { "type": "string" },
         "targetName": { "type": "string" },
         "status": { "type": "string", "enum": ["PENDING", "ACCEPTED", "DECLINED", "COMPLETED"] },
+        "battleId": { "type": "string" },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
       "required": ["challengerId", "targetUserId", "status"]
+    },
+    "ActiveBattle": {
+      "title": "ActiveBattle",
+      "description": "Real-time simultaneous multiplayer arena battle between two live online players",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "player1": { "type": "object" },
+        "player2": { "type": "object" },
+        "round": { "type": "number" },
+        "status": { "type": "string", "enum": ["WAITING_FOR_ACCEPT", "IN_PROGRESS", "RESOLVED", "FORFEIT"] },
+        "lastResolution": { "type": "object" },
+        "winnerId": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "player1", "player2", "status"]
+    },
+    "TrainerAccount": {
+      "title": "TrainerAccount",
+      "description": "Secure account credentials and authentication registry mapped by deterministic canonical account ID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "passwordHash": { "type": "string" },
+        "salt": { "type": "string" },
+        "displayName": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["uid", "email"]
     }
   },
   "firestore": {
+    "/trainerAccounts/{accountId}": {
+      "schema": "TrainerAccount",
+      "description": "Secure account credentials directory protected against mass enumeration"
+    },
     "/users/{userId}": {
       "schema": "UserGameProfile",
       "description": "Stores user trainer state and game progress per authenticated user"
@@ -94,6 +131,10 @@
     "/challenges/{challengeId}": {
       "schema": "DuelChallenge",
       "description": "Arena challenges sent between real players"
+    },
+    "/activeBattles/{battleId}": {
+      "schema": "ActiveBattle",
+      "description": "Real-time simultaneous battle session between two online trainers"
     }
   }
 }

@@ -1,0 +1,1636 @@
+import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  getDoc, 
+  setDoc, 
+  onSnapshot, 
+  getDocFromServer,
+  Unsubscribe 
+} from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
+import { 
+  GameState, 
+  PublicTrainer, 
+  DuelChallenge, 
+  User, 
+  ActiveBattleSession, 
+  BattlePlayerState, 
+  BattleActionType, 
+  BattleTurnAction,
+  RoundResolution 
+} from '../types';
+import { 
+  collection, 
+  query, 
+  where, 
+  getDocs,
+  deleteDoc, 
+  updateDoc 
+} from 'firebase/firestore';
+import { updateProfile } from 'firebase/auth';
+import { createInitialState } from './storage';
+
+// Initialize Firebase with environment variable overrides if provided (e.g., in Render, Vercel, or CI/CD)
+const activeFirebaseConfig = {
+  ...firebaseConfig,
+  apiKey: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_API_KEY) || firebaseConfig.apiKey || '',
+  projectId: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_PROJECT_ID) || firebaseConfig.projectId,
+  authDomain: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_AUTH_DOMAIN) || firebaseConfig.authDomain,
+  firestoreDatabaseId: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_FIREBASE_DATABASE_ID) || firebaseConfig.firestoreDatabaseId,
+};
+
+// Initialize Firebase
+const app = initializeApp(activeFirebaseConfig);
+
+// Critical: initialize with firestoreDatabaseId
+export const db = getFirestore(app, activeFirebaseConfig.firestoreDatabaseId);
+export const auth = getAuth(app);
+
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+/**
+ * Recursively strips all `undefined` values from an object, nested objects, and arrays.
+ * Firestore strictly rejects `undefined` values and throws:
+ * "Function setDoc() called with invalid data. Unsupported field value: undefined"
+ */
+export function sanitizeForFirestore<T>(data: T): T {
+  if (data === undefined) {
+    return null as unknown as T;
+  }
+  if (data === null || typeof data !== 'object') {
+    return data;
+  }
+  if (data instanceof Date) {
+    return data.toISOString() as unknown as T;
+  }
+  if (Array.isArray(data)) {
+    return data
+      .filter((item) => item !== undefined)
+      .map((item) => sanitizeForFirestore(item)) as unknown as T;
+  }
+  const clean: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    if (value !== undefined) {
+      clean[key] = sanitizeForFirestore(value);
+    }
+  }
+  return clean as T;
+}
+
+// Test connectivity on initial boot
+export async function testConnection(): Promise<boolean> {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.warn('Firebase client is offline or connecting.');
+    }
+    return false;
+  }
+}
+
+export interface UsernameAvailabilityResult {
+  available: boolean;
+  error?: string;
+}
+
+// Check if a username is available (case-insensitive) across all accounts
+export async function checkUsernameAvailable(
+  username: string, 
+  currentUserId?: string
+): Promise<UsernameAvailabilityResult> {
+  const clean = username.trim().toLowerCase();
+  if (!clean || clean.length < 3 || clean.length > 20) {
+    return { available: false, error: 'Username must be between 3 and 20 characters.' };
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(clean)) {
+    return { available: false, error: 'Only letters, numbers, underscores, and hyphens are allowed.' };
+  }
+  try {
+    const docSnap = await getDoc(doc(db, 'usernames', clean));
+    if (!docSnap.exists()) {
+      return { available: true };
+    }
+    const data = docSnap.data();
+    if (currentUserId && data?.userId === currentUserId) {
+      return { available: true };
+    }
+    return { available: false, error: `"${username.trim()}" is already claimed by another trainer account.` };
+  } catch (error: any) {
+    console.warn('Check username query fallback:', error);
+    // If Firestore query encounters a temporary network glitch, check local cache
+    try {
+      const localClaimed = localStorage.getItem('liferpg_claimed_usernames_v1');
+      if (localClaimed) {
+        const parsed = JSON.parse(localClaimed);
+        if (parsed[clean] && parsed[clean] !== currentUserId) {
+          return { available: false, error: `"${username.trim()}" is already claimed by another trainer account.` };
+        }
+      }
+    } catch {
+      // Ignore local storage parse error
+    }
+    return { available: true };
+  }
+}
+
+// Claim a unique username for this user
+export async function claimUniqueUsername(
+  userId: string, 
+  username: string,
+  email?: string | null
+): Promise<{ success: boolean; error?: string }> {
+  const clean = username.trim();
+  const cleanLower = clean.toLowerCase();
+
+  if (!clean || clean.length < 3 || clean.length > 20) {
+    return { success: false, error: 'Username must be between 3 and 20 characters.' };
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(clean)) {
+    return { success: false, error: 'Username can only contain letters, numbers, hyphens, and underscores.' };
+  }
+
+  const cleanEmail = (email || auth.currentUser?.email || '').toLowerCase().trim();
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : '';
+  const currentUid = userId || canonicalId || auth.currentUser?.uid || '';
+  try {
+    try {
+      const existing = await getDoc(doc(db, 'usernames', cleanLower));
+      if (existing.exists()) {
+        const data = existing.data();
+        if (data.userId !== currentUid && data.userId !== canonicalId && data.userId !== auth.currentUser?.uid) {
+          return { success: false, error: 'This username is already taken by another account.' };
+        }
+      }
+    } catch (checkErr) {
+      console.warn('Username check warning, proceeding to reserve:', checkErr);
+    }
+
+    // Reserve username document in Firestore
+    try {
+      await setDoc(doc(db, 'usernames', cleanLower), sanitizeForFirestore({
+        userId: canonicalId || currentUid,
+        username: clean,
+        createdAt: new Date().toISOString(),
+      }));
+    } catch (setErr) {
+      console.warn('Firestore username reservation warning:', setErr);
+    }
+
+    // Update user game profile document across all valid IDs
+    const targets = Array.from(new Set([currentUid, canonicalId, auth.currentUser?.uid].filter(Boolean))) as string[];
+    for (const target of targets) {
+      try {
+        await setDoc(doc(db, 'users', target), sanitizeForFirestore({
+          userId: target,
+          hasClaimedUsername: true,
+          user: {
+            username: clean,
+          },
+          updatedAt: new Date().toISOString(),
+        }), { merge: true });
+      } catch (userErr) {
+        console.warn('Firestore user update warning:', userErr);
+      }
+      try {
+        await setDoc(doc(db, 'trainerAccounts', target), sanitizeForFirestore({
+          displayName: clean,
+        }), { merge: true });
+      } catch {}
+    }
+
+    // Update local cache
+    try {
+      for (const target of targets) {
+        localStorage.setItem(`liferpg_username_claimed_${target}`, 'true');
+        localStorage.setItem(`liferpg_trainer_name_${target}`, clean);
+      }
+      const localClaimed = localStorage.getItem('liferpg_claimed_usernames_v1');
+      const parsed = localClaimed ? JSON.parse(localClaimed) : {};
+      parsed[cleanLower] = canonicalId || currentUid;
+      localStorage.setItem('liferpg_claimed_usernames_v1', JSON.stringify(parsed));
+    } catch (storageErr) {
+      console.warn('Local storage cache warning:', storageErr);
+    }
+
+    // Update Firebase Auth display name if available
+    if (auth.currentUser) {
+      await updateProfile(auth.currentUser, { displayName: clean }).catch(() => {});
+    }
+
+    return { success: true };
+  } catch (error: any) {
+    console.error('Error claiming username:', error);
+    return { success: false, error: error.message || 'Failed to claim username. Please try again.' };
+  }
+}
+
+// Update trainer username and tagline (title) from Config screen
+export async function updateTrainerProfile(
+  userId: string,
+  newUsername: string,
+  newTitle: string,
+  oldUsername?: string,
+  email?: string | null
+): Promise<{ success: boolean; error?: string }> {
+  const cleanUser = newUsername.trim();
+  const cleanLower = cleanUser.toLowerCase();
+  const cleanTitle = newTitle.trim() || 'Blank Slate & Pure Potential';
+
+  if (!cleanUser || cleanUser.length < 3 || cleanUser.length > 20) {
+    return { success: false, error: 'Username must be between 3 and 20 characters.' };
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(cleanUser)) {
+    return { success: false, error: 'Username can only contain letters, numbers, hyphens, and underscores.' };
+  }
+
+  const cleanEmail = (email || auth.currentUser?.email || '').toLowerCase().trim();
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : userId;
+  const currentUid = canonicalId || auth.currentUser?.uid || userId;
+  const oldLower = (oldUsername || '').trim().toLowerCase();
+
+  try {
+    // If username changed, reserve new username and release old
+    if (cleanLower !== oldLower) {
+      const existing = await getDoc(doc(db, 'usernames', cleanLower));
+      if (existing.exists() && existing.data().userId !== currentUid && existing.data().userId !== userId) {
+        return { success: false, error: 'This username is already taken by another trainer.' };
+      }
+
+      // Reserve new username
+      await setDoc(doc(db, 'usernames', cleanLower), sanitizeForFirestore({
+        userId: currentUid,
+        username: cleanUser,
+        createdAt: new Date().toISOString(),
+      }));
+
+      // Release old username doc if valid
+      if (oldLower && oldLower !== cleanLower && oldLower !== 'trainer') {
+        try {
+          await deleteDoc(doc(db, 'usernames', oldLower));
+        } catch (delErr) {
+          console.warn('Could not release previous username:', delErr);
+        }
+      }
+    }
+
+    // Update user private document (canonicalId)
+    await setDoc(doc(db, 'users', currentUid), sanitizeForFirestore({
+      userId: currentUid,
+      hasClaimedUsername: true,
+      user: {
+        username: cleanUser,
+        title: cleanTitle,
+      },
+      updatedAt: new Date().toISOString(),
+    }), { merge: true });
+
+    // If userId differs from currentUid, also update userId doc
+    if (userId && userId !== currentUid) {
+      await setDoc(doc(db, 'users', userId), sanitizeForFirestore({
+        userId,
+        hasClaimedUsername: true,
+        user: {
+          username: cleanUser,
+          title: cleanTitle,
+        },
+        updatedAt: new Date().toISOString(),
+      }), { merge: true }).catch(() => {});
+    }
+
+    // Update publicTrainer entry for leaderboard and duels
+    await setDoc(doc(db, 'publicTrainers', currentUid), sanitizeForFirestore({
+      userId: currentUid,
+      username: cleanUser,
+      title: cleanTitle,
+      updatedAt: new Date().toISOString(),
+    }), { merge: true });
+
+    if (userId && userId !== currentUid) {
+      await setDoc(doc(db, 'publicTrainers', userId), sanitizeForFirestore({
+        userId,
+        username: cleanUser,
+        title: cleanTitle,
+        updatedAt: new Date().toISOString(),
+      }), { merge: true }).catch(() => {});
+    }
+
+    // Clean up any stale duplicate documents in publicTrainers with old username
+    if (oldLower && oldLower !== cleanLower) {
+      try {
+        const q = query(collection(db, 'publicTrainers'));
+        const snap = await getDocs(q);
+        snap.forEach((d) => {
+          if (d.id !== currentUid && d.id !== userId) {
+            const data = d.data();
+            if (data.username && data.username.toLowerCase().trim() === oldLower) {
+              deleteDoc(doc(db, 'publicTrainers', d.id)).catch(() => {});
+            }
+          }
+        });
+      } catch {
+        // Non-blocking cleanup
+      }
+    }
+
+    // Update trainerAccounts entry if email is available
+    if (cleanEmail) {
+      const accountId = emailToSafeAccountId(cleanEmail);
+      await setDoc(doc(db, 'trainerAccounts', accountId), sanitizeForFirestore({
+        displayName: cleanUser,
+        updatedAt: new Date().toISOString(),
+      }), { merge: true }).catch(() => {});
+    }
+
+    // Update Firebase Auth display name
+    if (auth.currentUser) {
+      await updateProfile(auth.currentUser, { displayName: cleanUser }).catch(() => {});
+    }
+
+    // Update local storage caches immediately
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(`liferpg_trainer_name_${currentUid}`, cleanUser);
+        if (userId) localStorage.setItem(`liferpg_trainer_name_${userId}`, cleanUser);
+        if (cleanEmail) {
+          localStorage.setItem(`liferpg_trainer_name_email_${cleanEmail}`, cleanUser);
+          localStorage.setItem(`liferpg_trainer_name_${cleanEmail}`, cleanUser);
+        }
+        localStorage.setItem('liferpg_trainer_name_user_player', cleanUser);
+        localStorage.setItem('liferpg_trainer_name_user_guest', cleanUser);
+        localStorage.setItem('liferpg_current_username', cleanUser);
+        localStorage.setItem(`liferpg_username_claimed_${currentUid}`, 'true');
+        if (userId) localStorage.setItem(`liferpg_username_claimed_${userId}`, 'true');
+        if (cleanEmail) localStorage.setItem(`liferpg_username_claimed_email_${cleanEmail}`, 'true');
+      } catch {
+        // Ignore local storage error
+      }
+    }
+
+    return { success: true };
+  } catch (error: any) {
+    console.error('Error updating trainer profile:', error);
+    return { success: false, error: error.message || 'Failed to update profile in Firestore.' };
+  }
+}
+
+// Check if user already claimed a unique username
+export async function checkUserHasClaimedUsername(userId: string, email?: string | null): Promise<boolean> {
+  if (!userId && !email) return false;
+  const cleanEmail = email ? email.toLowerCase().trim() : '';
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : userId;
+
+  // Check local cache first for instant response
+  try {
+    if (
+      localStorage.getItem(`liferpg_username_claimed_${canonicalId}`) === 'true' ||
+      localStorage.getItem(`liferpg_username_claimed_${userId}`) === 'true'
+    ) {
+      return true;
+    }
+  } catch {
+    // Ignore local storage error
+  }
+
+  try {
+    let docSnap = await getDoc(doc(db, 'users', canonicalId));
+
+    if (!docSnap.exists() && userId && userId !== canonicalId) {
+      const altSnap = await getDoc(doc(db, 'users', userId));
+      if (altSnap.exists()) {
+        docSnap = altSnap;
+      }
+    }
+    
+    // Fallback: If not found, check by email
+    if (!docSnap.exists() && cleanEmail) {
+      const q = query(collection(db, 'users'), where('email', '==', cleanEmail));
+      const querySnap = await getDocs(q);
+      if (!querySnap.empty) {
+        docSnap = querySnap.docs[0];
+      }
+    }
+
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      const username = data.user?.username;
+      const claimed = Boolean(
+        data.hasClaimedUsername ||
+        (username && typeof username === 'string' && username !== 'Trainer' && username.trim().length >= 3)
+      );
+      if (claimed) {
+        try {
+          localStorage.setItem(`liferpg_username_claimed_${canonicalId}`, 'true');
+          if (userId) localStorage.setItem(`liferpg_username_claimed_${userId}`, 'true');
+        } catch {}
+      }
+      return claimed;
+    }
+    return false;
+  } catch (error) {
+    console.warn('Check claimed username fallback:', error);
+    try {
+      return (
+        localStorage.getItem(`liferpg_username_claimed_${canonicalId}`) === 'true' ||
+        localStorage.getItem(`liferpg_username_claimed_${userId}`) === 'true'
+      );
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Check if trainer is considered live and online (clock-skew and background-tab tolerant)
+export function isTrainerOnline(trainer?: PublicTrainer | null): boolean {
+  if (!trainer) return false;
+  // If explicitly flagged offline, check if active in last 30s
+  if (trainer.isOnline === false) {
+    if (!trainer.lastActive) return false;
+    const lastActiveTime = new Date(trainer.lastActive).getTime();
+    if (isNaN(lastActiveTime)) return false;
+    const diff = Math.abs(Date.now() - lastActiveTime);
+    return diff < 30000;
+  }
+  // If isOnline is true or unset, check lastActive with broad tolerance (up to 15 mins)
+  if (!trainer.lastActive) {
+    return true;
+  }
+  const lastActiveTime = new Date(trainer.lastActive).getTime();
+  if (isNaN(lastActiveTime)) return true;
+  const diff = Date.now() - lastActiveTime;
+  // Background browser tabs throttle timers, and user devices may have clock skew (-10m to +15m)
+  return diff > -600000 && diff < 900000;
+}
+
+// Directly check if a trainer is currently online by querying Firestore document
+export async function checkTrainerIsOnline(userId: string): Promise<boolean> {
+  if (!userId) return false;
+  try {
+    const snap = await getDoc(doc(db, 'publicTrainers', userId));
+    if (!snap.exists()) return true;
+    const data = snap.data() as PublicTrainer;
+    return isTrainerOnline(data);
+  } catch (err) {
+    console.warn('Check trainer online error:', err);
+    return true;
+  }
+}
+
+// Real-time listener for a specific trainer's online presence
+export function subscribeToTrainerPresence(
+  userId: string,
+  onUpdate: (isOnline: boolean) => void
+): Unsubscribe {
+  return onSnapshot(
+    doc(db, 'publicTrainers', userId),
+    (snap) => {
+      if (!snap.exists()) {
+        onUpdate(false);
+        return;
+      }
+      const data = snap.data() as PublicTrainer;
+      onUpdate(isTrainerOnline(data));
+    },
+    (err) => {
+      console.warn('Trainer presence subscription error:', err);
+      onUpdate(false);
+    }
+  );
+}
+
+// Update presence for online status (uses setDoc with merge to ensure document existence)
+export async function updateTrainerPresence(userId: string, isOnline: boolean): Promise<void> {
+  const path = `publicTrainers/${userId}`;
+  try {
+    await setDoc(
+      doc(db, 'publicTrainers', userId),
+      sanitizeForFirestore({
+        userId,
+        isOnline,
+        lastActive: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }),
+      { merge: true }
+    );
+  } catch (error) {
+    // Fail silently on background heartbeat or unmount
+  }
+}
+
+// Publish public trainer profile to /publicTrainers for arena and leaderboard
+export async function syncPublicTrainerProfile(
+  userId: string,
+  user: User,
+  completedQuestsCount: number,
+  defeatedRivalsCount: number,
+  equipmentName?: string
+): Promise<void> {
+  if (!userId || !user || !user.username || user.username === 'Trainer') return;
+  const path = `publicTrainers/${userId}`;
+  try {
+    const payload: PublicTrainer = {
+      userId,
+      username: user.username,
+      level: user.level ?? 1,
+      title: user.title ?? 'Adventurer',
+      avatarId: user.avatarId ?? 'avatar-1',
+      specialization: user.specialization ?? 'ADVENTURER',
+      hp: user.hp ?? 100,
+      maxHp: user.maxHp ?? 100,
+      stamina: user.stamina ?? 50,
+      maxStamina: user.maxStamina ?? 50,
+      streak: user.streak ?? 1,
+      arenaStreak: user.arenaStreak ?? 0,
+      arenaWins: user.arenaWins ?? 0,
+      arenaLosses: user.arenaLosses ?? 0,
+      xp: user.xp ?? 0,
+      attributes: user.attributes ?? { str: 10, int: 10, end: 10, res: 10, dis: 10, wil: 10, cre: 10 },
+      equipmentName: equipmentName || 'Adventurer Equipment',
+      questsCleared: completedQuestsCount ?? 0,
+      defeatedRivalsCount: defeatedRivalsCount ?? 0,
+      isOnline: true,
+      lastActive: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await setDoc(doc(db, 'publicTrainers', userId), sanitizeForFirestore(payload), { merge: true });
+
+    // Clean up any stale duplicate documents in publicTrainers with the same username but different doc ID
+    const cleanLower = user.username.toLowerCase().trim();
+    const q = query(collection(db, 'publicTrainers'));
+    const snap = await getDocs(q);
+    snap.forEach((d) => {
+      if (d.id !== userId) {
+        const dData = d.data() as PublicTrainer;
+        if (dData.username && dData.username.toLowerCase().trim() === cleanLower) {
+          deleteDoc(doc(db, 'publicTrainers', d.id)).catch(() => {});
+        }
+      }
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+// Subscribe to all real-world players in /publicTrainers
+export function subscribeToPublicTrainers(
+  onUpdate: (trainers: PublicTrainer[]) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = 'publicTrainers';
+  return onSnapshot(
+    collection(db, 'publicTrainers'),
+    (snap) => {
+      const rawTrainers: PublicTrainer[] = [];
+      snap.forEach((docSnap) => {
+        rawTrainers.push(docSnap.data() as PublicTrainer);
+      });
+
+      // Deduplicate trainers by lowercase username and userId so each player appears only ONCE
+      const map = new Map<string, PublicTrainer>();
+      for (const t of rawTrainers) {
+        if (!t.username || t.username === 'Trainer') continue;
+        const key = t.username.toLowerCase().trim();
+        const existing = map.get(key);
+        if (!existing) {
+          map.set(key, t);
+        } else {
+          // Keep the one with higher level or more quests cleared
+          if ((t.level || 0) > (existing.level || 0) || (t.questsCleared || 0) > (existing.questsCleared || 0)) {
+            map.set(key, t);
+          }
+        }
+      }
+
+      onUpdate(Array.from(map.values()));
+    },
+    (error) => {
+      if (onError) onError(error);
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+// Send a duel challenge to a real player
+export async function sendDuelChallenge(
+  targetTrainer: PublicTrainer,
+  challenger: User
+): Promise<string> {
+  // 1. Ensure challenger presence is marked online
+  await updateTrainerPresence(challenger.id, true);
+
+  // 2. Verify target trainer presence (tolerant to clock skew and sync delay)
+  const isTargetOnline = isTrainerOnline(targetTrainer);
+  if (!isTargetOnline && targetTrainer.isOnline === false) {
+    throw new Error(`Trainer ${targetTrainer.username} is currently offline. Both trainers must be online to challenge and play.`);
+  }
+
+  const challengeId = `chal-${Date.now()}-${challenger.id.slice(0, 5)}`;
+  const path = `challenges/${challengeId}`;
+  try {
+    const payload: DuelChallenge = {
+      id: challengeId,
+      challengerId: challenger.id,
+      challengerName: challenger.username,
+      challengerAvatarId: challenger.avatarId,
+      challengerLevel: challenger.level,
+      challengerTitle: challenger.title,
+      challengerStats: {
+        hp: challenger.hp,
+        maxHp: challenger.maxHp,
+        stamina: challenger.stamina,
+        maxStamina: challenger.maxStamina,
+        attributes: challenger.attributes,
+      },
+      targetUserId: targetTrainer.userId,
+      targetName: targetTrainer.username,
+      status: 'PENDING',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await setDoc(doc(db, 'challenges', challengeId), sanitizeForFirestore(payload));
+    return challengeId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+// Listen for incoming challenges for the logged-in user
+export function subscribeToIncomingChallenges(
+  userId: string,
+  onUpdate: (challenges: DuelChallenge[]) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = 'challenges';
+  const q = query(
+    collection(db, 'challenges'),
+    where('targetUserId', '==', userId),
+    where('status', '==', 'PENDING')
+  );
+
+  return onSnapshot(
+    q,
+    (snap) => {
+      const challenges: DuelChallenge[] = [];
+      snap.forEach((d) => {
+        challenges.push(d.data() as DuelChallenge);
+      });
+      onUpdate(challenges);
+    },
+    (error) => {
+      console.warn(`Firestore incoming challenges subscription notice:`, error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+// Listen for outgoing challenges sent by the logged-in user (to detect acceptance & navigate into live battle)
+export function subscribeToOutgoingChallenges(
+  challengerId: string,
+  onUpdate: (challenges: DuelChallenge[]) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = 'challenges';
+  const q = query(
+    collection(db, 'challenges'),
+    where('challengerId', '==', challengerId)
+  );
+
+  return onSnapshot(
+    q,
+    (snap) => {
+      const challenges: DuelChallenge[] = [];
+      snap.forEach((d) => {
+        challenges.push(d.data() as DuelChallenge);
+      });
+      onUpdate(challenges);
+    },
+    (error) => {
+      console.warn(`Firestore outgoing challenges subscription notice:`, error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+// Accept challenge and create a real-time simultaneous battle session
+export async function acceptDuelChallengeAndStartBattle(
+  challenge: DuelChallenge,
+  currentUser: User
+): Promise<string> {
+  // 1. Ensure current user presence is marked online
+  await updateTrainerPresence(currentUser.id, true);
+
+  // 2. Battle session setup - always permit accepting a challenge
+  const battleId = `battle-${Date.now()}-${challenge.challengerId.slice(0, 4)}-${currentUser.id.slice(0, 4)}`;
+  const battlePath = `activeBattles/${battleId}`;
+
+  try {
+    const player1: BattlePlayerState = {
+      id: challenge.challengerId,
+      username: challenge.challengerName,
+      level: challenge.challengerLevel,
+      avatarId: challenge.challengerAvatarId,
+      title: challenge.challengerTitle,
+      hp: challenge.challengerStats.hp,
+      maxHp: challenge.challengerStats.maxHp,
+      stamina: challenge.challengerStats.stamina,
+      maxStamina: challenge.challengerStats.maxStamina,
+      attributes: challenge.challengerStats.attributes,
+      ready: true,
+      selectedAction: null,
+      isDefending: false,
+    };
+
+    const player2: BattlePlayerState = {
+      id: currentUser.id,
+      username: currentUser.username,
+      level: currentUser.level,
+      avatarId: currentUser.avatarId,
+      title: currentUser.title,
+      hp: currentUser.hp,
+      maxHp: currentUser.maxHp,
+      stamina: currentUser.stamina,
+      maxStamina: currentUser.maxStamina,
+      attributes: currentUser.attributes,
+      ready: true,
+      selectedAction: null,
+      isDefending: false,
+    };
+
+    const p1Speed = (challenge.challengerStats.attributes?.dis ?? 10) + (challenge.challengerStats.attributes?.wil ?? 10);
+    const p2Speed = (currentUser.attributes?.dis ?? 10) + (currentUser.attributes?.wil ?? 10);
+    const firstTurnId = p1Speed >= p2Speed ? challenge.challengerId : currentUser.id;
+
+    const battleSession: ActiveBattleSession = {
+      id: battleId,
+      challengeId: challenge.id,
+      player1,
+      player2,
+      round: 1,
+      currentTurn: firstTurnId,
+      turnCount: 1,
+      status: 'IN_PROGRESS',
+      lastAction: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // 1. Create active battle
+    await setDoc(doc(db, 'activeBattles', battleId), sanitizeForFirestore(battleSession));
+
+    // 2. Mark challenge as accepted with battleId
+    await updateDoc(doc(db, 'challenges', challenge.id), sanitizeForFirestore({
+      status: 'ACCEPTED',
+      battleId,
+      updatedAt: new Date().toISOString(),
+    }));
+
+    return battleId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, battlePath);
+  }
+}
+
+// Submit turn-based action in live duel (one player plays, then the other plays)
+export async function submitTurnBasedAction(
+  battleId: string,
+  userId: string,
+  action: BattleActionType
+): Promise<void> {
+  const path = `activeBattles/${battleId}`;
+  try {
+    const battleDocRef = doc(db, 'activeBattles', battleId);
+    const snap = await getDoc(battleDocRef);
+    if (!snap.exists()) return;
+
+    const battle = snap.data() as ActiveBattleSession;
+    if (battle.status !== 'IN_PROGRESS') return;
+
+    // Turn verification
+    const currentTurn = battle.currentTurn || battle.player1.id;
+    if (currentTurn !== userId) {
+      console.warn(`Action rejected: not ${userId}'s turn (current turn: ${currentTurn})`);
+      return;
+    }
+
+    const isPlayer1 = battle.player1.id === userId;
+    const actor = isPlayer1 ? battle.player1 : battle.player2;
+    const target = isPlayer1 ? battle.player2 : battle.player1;
+
+    const actorAttrs = actor.attributes || { str: 10, int: 10, end: 10, res: 10, dis: 10, wil: 10 };
+    const targetAttrs = target.attributes || { str: 10, int: 10, end: 10, res: 10, dis: 10, wil: 10 };
+
+    let damage = 0;
+    let heal = 0;
+    let isCrit = false;
+    let staminaCost = 0;
+    let newActorDefending = false;
+    let message = '';
+
+    if (action === 'RUN') {
+      await updateDoc(battleDocRef, {
+        status: 'FORFEIT',
+        forfeitById: userId,
+        winnerId: target.id,
+        loserId: actor.id,
+        lastAction: {
+          actorId: actor.id,
+          actorName: actor.username,
+          targetId: target.id,
+          action: 'RUN',
+          damage: 0,
+          heal: 0,
+          isCrit: false,
+          isDefending: false,
+          staminaSpent: 0,
+          message: `${actor.username} fled from the battle arena!`,
+          timestamp: Date.now(),
+        },
+        updatedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (action === 'STRIKE') {
+      staminaCost = 10;
+      // Attributes based: STR + level vs target RES (and defend stance)
+      const baseDmg = Math.max(12, Math.floor((actorAttrs.str * 1.9) + ((actor.level || 1) * 3) + 8));
+      const resMitigation = Math.floor(targetAttrs.res * 0.45);
+      const isTargetDefending = Boolean(target.isDefending);
+      const defMultiplier = isTargetDefending ? 0.35 : 1.0;
+
+      // Crit chance scaled by WIL and DIS
+      const critChance = Math.min(0.40, 0.05 + (actorAttrs.wil * 0.02) + (actorAttrs.dis * 0.01));
+      isCrit = Math.random() < critChance;
+      const critMultiplier = isCrit ? 1.6 : 1.0;
+
+      damage = Math.max(6, Math.floor((baseDmg - resMitigation) * defMultiplier * critMultiplier));
+
+      if (isCrit) {
+        message = isTargetDefending
+          ? `💥 CRITICAL STRIKE! ${actor.username} shatters ${target.username}'s guard for ${damage} damage!`
+          : `💥 CRITICAL HIT! ${actor.username} strikes ${target.username} for ${damage} massive damage!`;
+      } else if (isTargetDefending) {
+        message = `🛡️ BLOCKED! ${actor.username} strikes, but ${target.username}'s shield softens the blow to ${damage} damage!`;
+      } else {
+        message = `⚔️ ${actor.username} attacks ${target.username} for ${damage} damage!`;
+      }
+    } else if (action === 'FOCUS_SURGE') {
+      staminaCost = 22;
+      // Attributes based: INT * 2.3 + STR * 0.8 + level vs target RES
+      const baseDmg = Math.max(18, Math.floor((actorAttrs.int * 2.3) + (actorAttrs.str * 0.8) + ((actor.level || 1) * 4) + 12));
+      const resMitigation = Math.floor(targetAttrs.res * 0.35);
+      const isTargetDefending = Boolean(target.isDefending);
+      const defMultiplier = isTargetDefending ? 0.45 : 1.0;
+
+      const critChance = Math.min(0.50, 0.15 + (actorAttrs.wil * 0.03));
+      isCrit = Math.random() < critChance;
+      const critMultiplier = isCrit ? 1.55 : 1.25;
+
+      damage = Math.max(10, Math.floor((baseDmg - resMitigation) * defMultiplier * critMultiplier));
+
+      if (isCrit) {
+        message = `✨ ARCANE OVERCHARGE! ${actor.username} unleashes a devastating surge on ${target.username} for ${damage} damage!`;
+      } else {
+        message = `🔥 FOCUS SURGE! ${actor.username} blasts ${target.username} for ${damage} arcane damage!`;
+      }
+    } else if (action === 'DEFEND') {
+      newActorDefending = true;
+      staminaCost = -18; // restores 18 stamina
+      damage = 0;
+      message = `🛡️ ${actor.username} assumes a fortified defensive stance, raising defense and recovering stamina!`;
+    } else if (action === 'HEAL_POTION') {
+      staminaCost = 10;
+      // Attributes based: WIL + level
+      const healBase = Math.floor(25 + (actorAttrs.wil * 2.4) + ((actor.level || 1) * 3));
+      heal = Math.min(healBase, Math.max(0, (actor.maxHp || 100) - (actor.hp || 0)));
+      damage = 0;
+      message = `🧪 ${actor.username} quaffs a healing potion, recovering +${heal} HP!`;
+    }
+
+    // Apply HP changes
+    const newTargetHp = Math.max(0, (target.hp || 0) - damage);
+    // Target guard is broken / consumed on taking hit
+    const newTargetDefending = damage > 0 ? false : target.isDefending;
+
+    const newActorHp = Math.min(actor.maxHp || 100, (actor.hp || 0) + heal);
+    const newActorStamina = Math.max(0, Math.min(actor.maxStamina || 50, (actor.stamina || 0) - staminaCost));
+
+    const updatedActor: BattlePlayerState = {
+      ...actor,
+      hp: newActorHp,
+      stamina: newActorStamina,
+      isDefending: newActorDefending,
+      selectedAction: null,
+    };
+
+    const updatedTarget: BattlePlayerState = {
+      ...target,
+      hp: newTargetHp,
+      isDefending: newTargetDefending,
+      selectedAction: null,
+    };
+
+    const turnAction: BattleTurnAction = {
+      actorId: actor.id,
+      actorName: actor.username,
+      targetId: target.id,
+      action,
+      damage,
+      heal,
+      isCrit,
+      isDefending: newActorDefending,
+      staminaSpent: staminaCost,
+      message,
+      timestamp: Date.now(),
+    };
+
+    const isBattleOver = newTargetHp <= 0;
+    const nextTurn = target.id;
+    const nextTurnCount = (battle.turnCount || 1) + 1;
+    const nextRound = Math.floor((nextTurnCount + 1) / 2);
+
+    const updatedP1 = isPlayer1 ? updatedActor : updatedTarget;
+    const updatedP2 = isPlayer1 ? updatedTarget : updatedActor;
+
+    await updateDoc(battleDocRef, {
+      player1: updatedP1,
+      player2: updatedP2,
+      currentTurn: isBattleOver ? null : nextTurn,
+      turnCount: nextTurnCount,
+      round: nextRound,
+      lastAction: turnAction,
+      status: isBattleOver ? 'RESOLVED' : 'IN_PROGRESS',
+      winnerId: isBattleOver ? actor.id : null,
+      loserId: isBattleOver ? target.id : null,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// Respond to an incoming challenge (accept or decline)
+export async function respondToDuelChallenge(challengeId: string, accept: boolean): Promise<void> {
+  const path = `challenges/${challengeId}`;
+  try {
+    await updateDoc(doc(db, 'challenges', challengeId), sanitizeForFirestore({
+      status: accept ? 'ACCEPTED' : 'DECLINED',
+      updatedAt: new Date().toISOString(),
+    }));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// Delete / dismiss challenge
+export async function deleteDuelChallenge(challengeId: string): Promise<void> {
+  const path = `challenges/${challengeId}`;
+  try {
+    await deleteDoc(doc(db, 'challenges', challengeId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+// Subscribe to a real-time active simultaneous battle session
+export function subscribeToActiveBattle(
+  battleId: string,
+  onUpdate: (battle: ActiveBattleSession | null) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = `activeBattles/${battleId}`;
+  return onSnapshot(
+    doc(db, 'activeBattles', battleId),
+    (snap) => {
+      if (snap.exists()) {
+        onUpdate(snap.data() as ActiveBattleSession);
+      } else {
+        onUpdate(null);
+      }
+    },
+    (error) => {
+      console.warn(`Firestore active battle subscription notice for ${path}:`, error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+// Submit player's combat move for current round in simultaneous battle
+export async function submitBattleAction(
+  battleId: string,
+  userId: string,
+  action: BattleActionType,
+  round: number
+): Promise<void> {
+  const path = `activeBattles/${battleId}`;
+  try {
+    const battleDocRef = doc(db, 'activeBattles', battleId);
+    const snap = await getDoc(battleDocRef);
+    if (!snap.exists()) return;
+
+    const battle = snap.data() as ActiveBattleSession;
+    const isPlayer1 = battle.player1?.id === userId;
+    const isPlayer2 = battle.player2?.id === userId;
+
+    if (!isPlayer1 && !isPlayer2) return;
+
+    const actionSubmission = {
+      action,
+      round,
+      timestamp: Date.now(),
+    };
+
+    if (isPlayer1) {
+      await updateDoc(battleDocRef, {
+        'player1.selectedAction': actionSubmission,
+        updatedAt: new Date().toISOString(),
+      });
+    } else {
+      await updateDoc(battleDocRef, {
+        'player2.selectedAction': actionSubmission,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// Deterministically resolve simultaneous round when both moves are submitted
+export async function resolveSimultaneousRound(
+  battleId: string,
+  battle: ActiveBattleSession
+): Promise<void> {
+  const path = `activeBattles/${battleId}`;
+  try {
+    const p1 = battle.player1;
+    const p2 = battle.player2;
+
+    if (!p1.selectedAction || !p2.selectedAction) return;
+    if (p1.selectedAction.round !== battle.round || p2.selectedAction.round !== battle.round) return;
+
+    const act1 = p1.selectedAction.action;
+    const act2 = p2.selectedAction.action;
+
+    const p1Attrs = p1.attributes || { str: 10, int: 10, end: 10, res: 10, dis: 10, wil: 10 };
+    const p2Attrs = p2.attributes || { str: 10, int: 10, end: 10, res: 10, dis: 10, wil: 10 };
+
+    // Damage calculations
+    // P1 -> P2
+    let p1Dmg = 0;
+    let p1Crit = false;
+    let p1StaminaSpent = 0;
+    let p1Heal = 0;
+
+    if (act1 === 'STRIKE') {
+      const baseDmg = Math.max(12, Math.floor((p1Attrs.str * 1.6) + ((p1.level || 1) * 3)));
+      const mitigation = Math.floor((p2Attrs.res * 0.4));
+      const defFactor = act2 === 'DEFEND' ? 0.35 : 1.0;
+      p1Crit = Math.random() < Math.min(0.35, 0.05 + (p1Attrs.dis * 0.02));
+      const critMultiplier = p1Crit ? 1.5 : 1.0;
+      p1Dmg = Math.max(5, Math.floor((baseDmg - mitigation) * defFactor * critMultiplier));
+      p1StaminaSpent = 12;
+    } else if (act1 === 'FOCUS_SURGE') {
+      const baseDmg = Math.max(16, Math.floor((p1Attrs.str * 2.0) + (p1Attrs.int * 0.8) + ((p1.level || 1) * 4)));
+      const mitigation = Math.floor((p2Attrs.res * 0.3));
+      const defFactor = act2 === 'DEFEND' ? 0.45 : 1.0;
+      p1Crit = true;
+      p1Dmg = Math.max(10, Math.floor((baseDmg - mitigation) * defFactor * 1.4));
+      p1StaminaSpent = 24;
+    } else if (act1 === 'HEAL_POTION') {
+      p1Heal = Math.min(40, (p1.maxHp || 50) - (p1.hp || 0));
+      p1StaminaSpent = 8;
+    } else if (act1 === 'DEFEND') {
+      p1StaminaSpent = -15; // recovers 15 stamina
+    }
+
+    // P2 -> P1
+    let p2Dmg = 0;
+    let p2Crit = false;
+    let p2StaminaSpent = 0;
+    let p2Heal = 0;
+
+    if (act2 === 'STRIKE') {
+      const baseDmg = Math.max(12, Math.floor((p2Attrs.str * 1.6) + ((p2.level || 1) * 3)));
+      const mitigation = Math.floor((p1Attrs.res * 0.4));
+      const defFactor = act1 === 'DEFEND' ? 0.35 : 1.0;
+      p2Crit = Math.random() < Math.min(0.35, 0.05 + (p2Attrs.dis * 0.02));
+      const critMultiplier = p2Crit ? 1.5 : 1.0;
+      p2Dmg = Math.max(5, Math.floor((baseDmg - mitigation) * defFactor * critMultiplier));
+      p2StaminaSpent = 12;
+    } else if (act2 === 'FOCUS_SURGE') {
+      const baseDmg = Math.max(16, Math.floor((p2Attrs.str * 2.0) + (p2Attrs.int * 0.8) + ((p2.level || 1) * 4)));
+      const mitigation = Math.floor((p1Attrs.res * 0.3));
+      const defFactor = act1 === 'DEFEND' ? 0.45 : 1.0;
+      p2Crit = true;
+      p2Dmg = Math.max(10, Math.floor((baseDmg - mitigation) * defFactor * 1.4));
+      p2StaminaSpent = 24;
+    } else if (act2 === 'HEAL_POTION') {
+      p2Heal = Math.min(40, (p2.maxHp || 50) - (p2.hp || 0));
+      p2StaminaSpent = 8;
+    } else if (act2 === 'DEFEND') {
+      p2StaminaSpent = -15;
+    }
+
+    // Calculate new HPs
+    const newP1Hp = Math.max(0, Math.min(p1.maxHp || 50, (p1.hp || 0) - p2Dmg + p1Heal));
+    const newP2Hp = Math.max(0, Math.min(p2.maxHp || 50, (p2.hp || 0) - p1Dmg + p2Heal));
+
+    // Calculate new Stamina
+    const newP1Stamina = Math.max(0, Math.min(p1.maxStamina || 50, (p1.stamina || 0) - p1StaminaSpent));
+    const newP2Stamina = Math.max(0, Math.min(p2.maxStamina || 50, (p2.stamina || 0) - p2StaminaSpent));
+
+    // Summary line
+    const summary = `Round ${battle.round}: ${p1.username} chose ${act1} (dealt ${p1Dmg} dmg) — ${p2.username} chose ${act2} (dealt ${p2Dmg} dmg)!`;
+
+    const resolution: RoundResolution = {
+      round: battle.round,
+      player1Action: act1,
+      player2Action: act2,
+      player1DamageDealt: p1Dmg,
+      player2DamageDealt: p2Dmg,
+      player1Crit: p1Crit,
+      player2Crit: p2Crit,
+      player1StaminaSpent: p1StaminaSpent,
+      player2StaminaSpent: p2StaminaSpent,
+      player1Heal: p1Heal,
+      player2Heal: p2Heal,
+      summary,
+      timestamp: Date.now(),
+    };
+
+    const isFinished = newP1Hp <= 0 || newP2Hp <= 0;
+    let winnerId: string | null = null;
+    let loserId: string | null = null;
+
+    if (isFinished) {
+      if (newP1Hp <= 0 && newP2Hp <= 0) {
+        winnerId = newP1Hp > newP2Hp ? p1.id : p2.id;
+        loserId = winnerId === p1.id ? p2.id : p1.id;
+      } else if (newP1Hp <= 0) {
+        winnerId = p2.id;
+        loserId = p1.id;
+      } else {
+        winnerId = p1.id;
+        loserId = p2.id;
+      }
+    }
+
+    await updateDoc(doc(db, 'activeBattles', battleId), {
+      'player1.hp': newP1Hp,
+      'player1.stamina': newP1Stamina,
+      'player1.selectedAction': null,
+      'player1.isDefending': act1 === 'DEFEND',
+      'player2.hp': newP2Hp,
+      'player2.stamina': newP2Stamina,
+      'player2.selectedAction': null,
+      'player2.isDefending': act2 === 'DEFEND',
+      round: isFinished ? battle.round : battle.round + 1,
+      lastResolution: resolution,
+      status: isFinished ? 'RESOLVED' : 'IN_PROGRESS',
+      winnerId: winnerId || null,
+      loserId: loserId || null,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (isFinished && battle.challengeId) {
+      updateDoc(doc(db, 'challenges', battle.challengeId), {
+        status: 'COMPLETED',
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// Forfeit active battle
+export async function forfeitActiveBattle(battleId: string, userId: string): Promise<void> {
+  const path = `activeBattles/${battleId}`;
+  try {
+    const snap = await getDoc(doc(db, 'activeBattles', battleId));
+    if (!snap.exists()) return;
+    const battle = snap.data() as ActiveBattleSession;
+    const winnerId = battle.player1.id === userId ? battle.player2.id : battle.player1.id;
+
+    await updateDoc(doc(db, 'activeBattles', battleId), {
+      status: 'FORFEIT',
+      forfeitById: userId,
+      winnerId,
+      loserId: userId,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (battle.challengeId) {
+      updateDoc(doc(db, 'challenges', battle.challengeId), {
+        status: 'COMPLETED',
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// Award default victory when an opponent disconnects or goes offline during an active live battle
+export async function handleBattleOpponentDisconnect(
+  battleId: string,
+  disconnectedUserId: string
+): Promise<void> {
+  const path = `activeBattles/${battleId}`;
+  try {
+    const snap = await getDoc(doc(db, 'activeBattles', battleId));
+    if (!snap.exists()) return;
+    const battle = snap.data() as ActiveBattleSession;
+    if (battle.status !== 'IN_PROGRESS') return;
+
+    const winnerId = battle.player1.id === disconnectedUserId ? battle.player2.id : battle.player1.id;
+    const summary = `Battle concluded by opponent disconnection: Rival went offline. Both trainers must be online to play.`;
+
+    await updateDoc(doc(db, 'activeBattles', battleId), {
+      status: 'RESOLVED',
+      winnerId,
+      loserId: disconnectedUserId,
+      forfeitById: disconnectedUserId,
+      lastResolution: {
+        round: battle.round,
+        player1Action: 'DEFEND',
+        player2Action: 'DEFEND',
+        player1DamageDealt: 0,
+        player2DamageDealt: 0,
+        player1Crit: false,
+        player2Crit: false,
+        player1StaminaSpent: 0,
+        player2StaminaSpent: 0,
+        player1Heal: 0,
+        player2Heal: 0,
+        summary,
+        timestamp: Date.now(),
+      },
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (battle.challengeId) {
+      updateDoc(doc(db, 'challenges', battle.challengeId), {
+        status: 'COMPLETED',
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+
+// Helper to derive safe account ID
+export function emailToSafeAccountId(email: string): string {
+  const clean = email.toLowerCase().trim();
+  try {
+    return 'acc_' + btoa(clean).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  } catch {
+    return 'acc_' + clean.replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+}
+
+// Cloud Persistence: Save User Game State
+export async function saveUserStateToCloud(
+  userId: string, 
+  state: GameState, 
+  email?: string | null
+): Promise<void> {
+  if (!userId || !state || !state.user) {
+    console.warn('saveUserStateToCloud: skipped invalid state or userId', { userId, state });
+    return;
+  }
+
+  const cleanEmail = (email || auth.currentUser?.email || '').toLowerCase().trim();
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : userId;
+  const targetId = canonicalId;
+  const path = `users/${targetId}`;
+
+  try {
+    const rawPayload = {
+      userId: targetId,
+      email: cleanEmail,
+      emailVerified: auth.currentUser?.emailVerified || false,
+      user: {
+        ...state.user,
+        id: targetId,
+      },
+      inventory: state.inventory || [],
+      quests: state.quests || [],
+      badges: state.badges || [],
+      rivals: state.rivals || [],
+      battleHistory: state.battleHistory || [],
+      settings: state.settings || {
+        soundEnabled: true,
+        crtFilterEnabled: false,
+        gameboyFilterEnabled: false,
+        reducedMotion: false,
+      },
+      hasCompletedOnboarding: state.hasCompletedOnboarding ?? true,
+      hasClaimedUsername: Boolean(
+        state.hasClaimedUsername ||
+        (state.user?.username && state.user.username !== 'Trainer' && state.user.username.trim().length >= 3)
+      ),
+      defeatedRivalsCount: state.defeatedRivalsCount || 0,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const payload = sanitizeForFirestore(rawPayload);
+    await setDoc(doc(db, 'users', targetId), payload, { merge: true });
+
+    // If userId was different from canonical targetId, remove the obsolete duplicate
+    if (userId && userId !== targetId) {
+      deleteDoc(doc(db, 'users', userId)).catch(() => {});
+    }
+
+    // Ensure trainer account mapping exists for persistent email login
+    if (cleanEmail) {
+      const emailPrefix = cleanEmail.split('@')[0].toLowerCase();
+      const accountId = emailToSafeAccountId(cleanEmail);
+      const isCustomUsername = 
+        state.user.username && 
+        state.user.username !== 'Trainer' && 
+        state.user.username.toLowerCase() !== emailPrefix;
+
+      const accountPayload: Record<string, any> = {
+        uid: targetId,
+        email: cleanEmail,
+        updatedAt: new Date().toISOString(),
+      };
+      if (isCustomUsername) {
+        accountPayload.displayName = state.user.username;
+      }
+
+      setDoc(
+        doc(db, 'trainerAccounts', accountId),
+        sanitizeForFirestore(accountPayload),
+        { merge: true }
+      ).catch(() => {});
+    }
+
+    // Automatically sync public trainer profile for real-world arena & leaderboard competition
+    if (state.user && state.user.username && state.user.username !== 'Trainer' && targetId !== 'user_player') {
+      const completedCount = (state.quests || []).filter((q) => q.status === 'COMPLETED').length;
+      syncPublicTrainerProfile(
+        targetId,
+        state.user,
+        completedCount,
+        state.defeatedRivalsCount || 0
+      ).catch((e) => console.warn('Public trainer sync error:', e));
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+// Cloud Persistence: Load User Game State
+export async function loadUserStateFromCloud(userId: string, email?: string | null): Promise<GameState | null> {
+  if (!userId && !email) return null;
+  const cleanEmail = (email || auth.currentUser?.email || '').toLowerCase().trim();
+  const canonicalId = cleanEmail ? emailToSafeAccountId(cleanEmail) : userId;
+  const emailPrefix = cleanEmail ? cleanEmail.split('@')[0].toLowerCase() : '';
+  const path = `users/${canonicalId}`;
+
+  const isCustomName = (val?: string | null): boolean => {
+    if (!val) return false;
+    const s = val.trim();
+    if (!s || s === 'Trainer') return false;
+    if (emailPrefix && s.toLowerCase() === emailPrefix) return false;
+    return true;
+  };
+
+  try {
+    // 0. Look up registered trainer name from trainerAccounts first
+    let registeredTrainerName: string | null = null;
+    if (cleanEmail) {
+      try {
+        const accountId = emailToSafeAccountId(cleanEmail);
+        const accSnap = await getDoc(doc(db, 'trainerAccounts', accountId));
+        if (accSnap.exists()) {
+          const accData = accSnap.data();
+          if (isCustomName(accData.displayName)) {
+            registeredTrainerName = accData.displayName.trim();
+          }
+        }
+      } catch {}
+    }
+
+    // 1. Try canonical ID first
+    let docSnap = await getDoc(doc(db, 'users', canonicalId));
+
+    // 2. If canonical not found and userId differs, try userId
+    if (!docSnap.exists() && userId && userId !== canonicalId) {
+      const altSnap = await getDoc(doc(db, 'users', userId));
+      if (altSnap.exists()) {
+        docSnap = altSnap;
+      }
+    }
+
+    // 3. If still not found and auth.currentUser has a different UID, try auth.currentUser.uid
+    if (!docSnap.exists() && auth.currentUser?.uid && auth.currentUser.uid !== canonicalId && auth.currentUser.uid !== userId) {
+      const authSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+      if (authSnap.exists()) {
+        docSnap = authSnap;
+      }
+    }
+
+    // 4. Fallback: If not found, search users collection by email
+    if (!docSnap.exists() && cleanEmail) {
+      const q = query(collection(db, 'users'), where('email', '==', cleanEmail));
+      const querySnap = await getDocs(q);
+      if (!querySnap.empty) {
+        let bestDoc = querySnap.docs[0];
+        let bestScore = -1;
+        for (const d of querySnap.docs) {
+          const dData = d.data();
+          const score = (dData.user?.level || 1) * 100 + (dData.quests?.length || 0) * 10 + (dData.inventory?.length || 0);
+          if (score > bestScore) {
+            bestScore = score;
+            bestDoc = d;
+          }
+        }
+        docSnap = bestDoc;
+      }
+    }
+
+    // 5. Fallback: If not found in users, check trainerAccounts collection
+    if (!docSnap.exists() && cleanEmail) {
+      const accountId = emailToSafeAccountId(cleanEmail);
+      const accSnap = await getDoc(doc(db, 'trainerAccounts', accountId));
+      if (accSnap.exists()) {
+        const accData = accSnap.data();
+        const trainerName = registeredTrainerName || (isCustomName(accData.displayName) ? accData.displayName.trim() : 'Trainer');
+        const base = createInitialState(trainerName, canonicalId);
+        return {
+          ...base,
+          user: {
+            ...base.user,
+            id: canonicalId,
+            username: trainerName,
+          },
+          hasClaimedUsername: true,
+        };
+      }
+    }
+
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      if (!data) return null;
+
+      let resolvedUsername = registeredTrainerName;
+      if (!resolvedUsername) {
+        if (isCustomName(data.user?.username)) {
+          resolvedUsername = data.user.username.trim();
+        } else if (isCustomName(data.displayName)) {
+          resolvedUsername = data.displayName.trim();
+        } else {
+          resolvedUsername = 'Trainer';
+        }
+      }
+
+      // If document previously had an email prefix, heal it with the real registered trainer name
+      if (registeredTrainerName && data.user?.username !== registeredTrainerName) {
+        setDoc(doc(db, 'users', canonicalId), {
+          displayName: registeredTrainerName,
+          user: { ...(data.user || {}), username: registeredTrainerName },
+          updatedAt: new Date().toISOString(),
+        }, { merge: true }).catch(() => {});
+      }
+
+      const base = createInitialState(resolvedUsername, canonicalId);
+
+      const loadedState: GameState = {
+        ...base,
+        ...data,
+        user: {
+          ...base.user,
+          ...(data.user || {}),
+          id: canonicalId,
+          username: resolvedUsername,
+        },
+        inventory: data.inventory || [],
+        items: [], // hydrated by client catalog
+        quests: data.quests || [],
+        badges: data.badges || [],
+        rivals: data.rivals || [],
+        battleHistory: data.battleHistory || [],
+        settings: data.settings || {
+          soundEnabled: true,
+          crtFilterEnabled: false,
+          gameboyFilterEnabled: false,
+          reducedMotion: false,
+        },
+        hasCompletedOnboarding: data.hasCompletedOnboarding ?? true,
+        hasClaimedUsername: true,
+        defeatedRivalsCount: data.defeatedRivalsCount || 0,
+      };
+
+      // If document was loaded from an obsolete non-canonical ID, migrate to canonicalId and remove old doc
+      if (docSnap.id !== canonicalId) {
+        setDoc(doc(db, 'users', canonicalId), sanitizeForFirestore({
+          ...data,
+          userId: canonicalId,
+          user: {
+            ...data.user,
+            id: canonicalId,
+          }
+        }), { merge: true }).catch(() => {});
+        deleteDoc(doc(db, 'users', docSnap.id)).catch(() => {});
+      }
+
+      return loadedState;
+    }
+    return null;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+    return null;
+  }
+}
+
+// Real-time synchronization subscription across devices
+export function subscribeToUserState(
+  userId: string,
+  onUpdate: (state: GameState) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = `users/${userId}`;
+  return onSnapshot(
+    doc(db, 'users', userId),
+    (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        onUpdate({
+          user: data.user,
+          inventory: data.inventory || [],
+          items: [],
+          quests: data.quests || [],
+          badges: data.badges || [],
+          rivals: data.rivals || [],
+          battleHistory: data.battleHistory || [],
+          settings: data.settings || {
+            soundEnabled: true,
+            crtFilterEnabled: false,
+            gameboyFilterEnabled: false,
+            reducedMotion: false,
+          },
+          hasCompletedOnboarding: data.hasCompletedOnboarding ?? true,
+          defeatedRivalsCount: data.defeatedRivalsCount || 0,
+        });
+      }
+    },
+    (error) => {
+      if (onError) onError(error);
+      handleFirestoreError(error, OperationType.GET, path);
+    }
+  );
+}
