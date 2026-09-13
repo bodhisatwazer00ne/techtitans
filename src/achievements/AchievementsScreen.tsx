@@ -3,7 +3,7 @@ import { Badge } from '../../types';
 import { RpgWindow } from '../rpg/RpgWindow';
 import { PixelIcon } from '../rpg/PixelIcon';
 import { chiptune } from '../../services/audio';
-
+//updated
 interface AchievementsScreenProps {
   badges: Badge[];
 }
